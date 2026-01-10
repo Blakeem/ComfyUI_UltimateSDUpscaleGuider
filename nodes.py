@@ -374,19 +374,15 @@ class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
 
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
+# This fork only exports Guider nodes - for non-guider nodes, use the original:
+# https://github.com/ssitu/ComfyUI_UltimateSDUpscale
 NODE_CLASS_MAPPINGS = {
-    "UltimateSDUpscale": UltimateSDUpscale,
-    "UltimateSDUpscaleNoUpscale": UltimateSDUpscaleNoUpscale,
-    "UltimateSDUpscaleCustomSample": UltimateSDUpscaleCustomSample,
     "UltimateSDUpscaleGuider": UltimateSDUpscaleGuider,
     "UltimateSDUpscaleNoUpscaleGuider": UltimateSDUpscaleNoUpscaleGuider,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UltimateSDUpscale": "Ultimate SD Upscale",
-    "UltimateSDUpscaleNoUpscale": "Ultimate SD Upscale (No Upscale)",
-    "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)",
     "UltimateSDUpscaleGuider": "Ultimate SD Upscale (Guider)",
     "UltimateSDUpscaleNoUpscaleGuider": "Ultimate SD Upscale (No Upscale, Guider)",
 }

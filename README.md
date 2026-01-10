@@ -46,9 +46,8 @@ The Guider nodes skip per-tile conditioning cropping since conditioning is inter
 1. Git must be installed on your system. Verify by running `git -v` in a terminal.
 2. Enter the following command from the terminal starting in ComfyUI/custom_nodes/
     ```
-    git clone https://github.com/your-username/ComfyUI_UltimateSDUpscaleGuider
+    git clone https://github.com/Blakeem/ComfyUI_UltimateSDUpscaleGuider
     ```
-    *(Replace `your-username` with your GitHub username if you've published this fork)*
 
 ### Manual Download
 1. Download the zip file by clicking the green "Code" button on the GitHub repository page and selecting "Download ZIP".

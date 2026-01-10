@@ -1,14 +1,13 @@
 [project]
-name = "comfyui_ultimatesdupscale"
-description = "ComfyUI nodes for the Ultimate Stable Diffusion Upscale script by Coyote-A."
-version = "1.6.2"
+name = "comfyui-ultimatesdupscale-guider"
+description = "ComfyUI nodes for Ultimate SD Upscale with Guider support for custom guiders like PerpNegGuider. Fork of ComfyUI_UltimateSDUpscale."
+version = "1.0.0"
 license = { file = "LICENSE" }
 
 [project.urls]
-Repository = "https://github.com/ssitu/ComfyUI_UltimateSDUpscale"
-#  Used by Comfy Registry https://comfyregistry.org
+Repository = "https://github.com/Blakeem/ComfyUI_UltimateSDUpscaleGuider"
 
 [tool.comfy]
-PublisherId = "ssit"
-DisplayName = "ComfyUI_UltimateSDUpscale"
+PublisherId = "blake"
+DisplayName = "Ultimate SD Upscale (Guider)"
 Icon = ""

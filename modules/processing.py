@@ -123,7 +123,107 @@ class StableDiffusionProcessing:
         # Undo changes to progress bar flag when node is done or cancelled
         if self.progress_bar_enabled:
             comfy.utils.PROGRESS_BAR_ENABLED = True
-    
+
+
+class StableDiffusionProcessingGuider:
+    """
+    Processing class for guider-based sampling.
+    Similar to StableDiffusionProcessing but uses a GUIDER instead of
+    separate model, positive, negative, and cfg inputs.
+    """
+
+    def __init__(
+        self,
+        init_img,
+        guider,
+        sampler,
+        sigmas,
+        vae,
+        seed,
+        upscale_by,
+        uniform_tile_mode,
+        tiled_decode,
+        tile_width,
+        tile_height,
+        redraw_mode,
+        seam_fix_mode,
+    ):
+        # Variables used by the USDU script
+        self.init_images = [init_img]
+        self.image_mask = None
+        self.mask_blur = 0
+        self.inpaint_full_res_padding = 0
+        self.width = init_img.width * upscale_by
+        self.height = init_img.height * upscale_by
+        self.rows = round(self.height / tile_height)
+        self.cols = round(self.width / tile_width)
+
+        # Guider-based sampling inputs
+        self.guider = guider
+        self.sampler = sampler
+        self.sigmas = sigmas
+        self.vae = vae
+        self.seed = seed
+
+        # Mark this as guider-based processing
+        self.use_guider = True
+
+        # Not used in guider path but kept for compatibility
+        self.model = None
+        self.positive = None
+        self.negative = None
+        self.cfg = None
+        self.steps = None
+        self.sampler_name = None
+        self.scheduler = None
+        self.denoise = None
+        self.custom_sampler = None
+        self.custom_sigmas = None
+
+        # Variables used only by this script
+        self.init_size = init_img.width, init_img.height
+        self.upscale_by = upscale_by
+        self.uniform_tile_mode = uniform_tile_mode
+        self.tiled_decode = tiled_decode
+        self.vae_decoder = VAEDecode()
+        self.vae_encoder = VAEEncode()
+        self.vae_decoder_tiled = VAEDecodeTiled()
+
+        if self.tiled_decode:
+            print("[USDU Guider] Using tiled decode")
+
+        # Other required A1111 variables for the USDU script that is currently unused in this script
+        self.extra_generation_params = {}
+
+        # Load config file for USDU
+        config_path = os.path.join(os.path.dirname(__file__), os.pardir, 'config.json')
+        config = {}
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+
+        # Progress bar for the entire process instead of per tile
+        self.progress_bar_enabled = False
+        if comfy.utils.PROGRESS_BAR_ENABLED:
+            self.progress_bar_enabled = True
+            comfy.utils.PROGRESS_BAR_ENABLED = config.get('per_tile_progress', True)
+            self.tiles = 0
+            if redraw_mode.value != USDUMode.NONE.value:
+                self.tiles += self.rows * self.cols
+            if seam_fix_mode.value == USDUSFMode.BAND_PASS.value:
+                self.tiles += (self.rows - 1) + (self.cols - 1)
+            elif seam_fix_mode.value == USDUSFMode.HALF_TILE.value:
+                self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows
+            elif seam_fix_mode.value == USDUSFMode.HALF_TILE_PLUS_INTERSECTIONS.value:
+                self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows + (self.rows - 1) * (self.cols - 1)
+            self.pbar = None
+
+    def __del__(self):
+        # Undo changes to progress bar flag when node is done or cancelled
+        if self.progress_bar_enabled:
+            comfy.utils.PROGRESS_BAR_ENABLED = True
+
+
 class Processed:
 
     def __init__(self, p: StableDiffusionProcessing, images: list, seed: int, info: str):
@@ -166,6 +266,48 @@ def sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
     (samples,) = common_ksampler(model, seed, steps, cfg, sampler_name,
                                  scheduler, positive, negative, latent, denoise=denoise)
     return samples
+
+
+def sample_with_guider(guider, seed, sampler, sigmas, latent):
+    """
+    Sample using a guider instead of separate model/conditioning/cfg.
+
+    Args:
+        guider: A GUIDER object that encapsulates model, conditioning, and CFG
+        seed: Random seed for noise generation
+        sampler: A SAMPLER object (from KSamplerSelect node)
+        sigmas: A SIGMAS tensor (noise schedule from BasicScheduler, etc.)
+        latent: Latent image dict with 'samples' key
+
+    Returns:
+        Latent samples dict
+    """
+    # Generate noise from seed
+    latent_image = latent["samples"]
+    batch_inds = latent.get("batch_index", None)
+
+    # Generate noise using ComfyUI's prepare_noise
+    noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+
+    # Get noise mask if present
+    noise_mask = latent.get("noise_mask", None)
+
+    # Call guider.sample() - the guider handles the denoising loop
+    samples = guider.sample(
+        noise,
+        latent_image,
+        sampler,
+        sigmas,
+        denoise_mask=noise_mask,
+        callback=None,
+        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+        seed=seed
+    )
+
+    # Return in latent dict format
+    out = latent.copy()
+    out["samples"] = samples
+    return out
 
 
 def process_images(p: StableDiffusionProcessing) -> Processed:
@@ -222,17 +364,20 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         if tile.size != tile_size:
             tiles[i] = tile.resize(tile_size, Image.Resampling.LANCZOS)
 
-    # Crop conditioning
-    positive_cropped = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size)
-    negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size)
-
     # Encode the image
     batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
     (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
 
-    # Generate samples
-    samples = sample(p.model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler, positive_cropped,
-                     negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
+    # Generate samples - use guider path or standard path
+    if getattr(p, 'use_guider', False):
+        # Guider path: conditioning is internal to the guider, skip crop_cond
+        samples = sample_with_guider(p.guider, p.seed, p.sampler, p.sigmas, latent)
+    else:
+        # Standard path: crop conditioning for each tile
+        positive_cropped = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size)
+        negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size)
+        samples = sample(p.model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler, positive_cropped,
+                         negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
 
     # Update the progress bar
     if p.progress_bar_enabled:

@@ -5,7 +5,7 @@ import torch
 import comfy
 from usdu_patch import usdu
 from utils import tensor_to_pil, pil_to_tensor
-from modules.processing import StableDiffusionProcessing
+from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider
 import modules.shared as shared
 from modules.upscaler import UpscalerData
 
@@ -55,6 +55,43 @@ def USDU_base_inputs():
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
         # Misc
         ("force_uniform_tiles", ("BOOLEAN", {"default": True, "tooltip": "Force all tiles to be the same as the set tile size, even when tiles could be smaller. This can help prevent the model from working with irregular tile sizes."})),
+        ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
+    ]
+
+    optional = []
+
+    return required, optional
+
+
+def USDU_guider_base_inputs():
+    """
+    Input definitions for guider-based USDU nodes.
+    Uses GUIDER, SAMPLER, and SIGMAS instead of model/conditioning/cfg/sampler_name/scheduler.
+    """
+    required = [
+        ("image", ("IMAGE", {"tooltip": "The image to upscale."})),
+        # Guider-based sampling params
+        ("guider", ("GUIDER", {"tooltip": "A guider that encapsulates the model, conditioning, and CFG. Use CFGGuider, PerpNegGuider, or other guider nodes."})),
+        ("sampler", ("SAMPLER", {"tooltip": "The sampler to use. Use KSamplerSelect node to create this."})),
+        ("sigmas", ("SIGMAS", {"tooltip": "The noise schedule. Use BasicScheduler or other scheduler nodes to create this. The denoise is configured in the scheduler."})),
+        ("vae", ("VAE", {"tooltip": "The VAE model to use for tiles."})),
+        ("upscale_by", ("FLOAT", {"default": 2, "min": 0.05, "max": 4, "step": 0.05, "tooltip": "The factor to upscale the image by."})),
+        ("seed", ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "tooltip": "The seed to use for noise generation."})),
+        # Upscale Params
+        ("upscale_model", ("UPSCALE_MODEL", {"tooltip": "The upscaler model for upscaling the image."})),
+        ("mode_type", (list(MODES.keys()), {"tooltip": "The tiling order to use for the redraw step."})),
+        ("tile_width", ("INT", {"default": 512, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The width of each tile."})),
+        ("tile_height", ("INT", {"default": 512, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The height of each tile."})),
+        ("mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the mask."})),
+        ("tile_padding", ("INT", {"default": 32, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply between tiles."})),
+        # Seam fix params
+        ("seam_fix_mode", (list(SEAM_FIX_MODES.keys()), {"tooltip": "The seam fix mode to use."})),
+        ("seam_fix_denoise", ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The denoising strength to use for the seam fix."})),
+        ("seam_fix_width", ("INT", {"default": 64, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The width of the bands used for the Band Pass seam fix mode."})),
+        ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
+        ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
+        # Misc
+        ("force_uniform_tiles", ("BOOLEAN", {"default": True, "tooltip": "Force all tiles to be the same as the set tile size, even when tiles could be smaller."})),
         ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
     ]
 
@@ -227,17 +264,129 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
                 custom_sampler, custom_sigmas)
 
 
+class UltimateSDUpscaleGuider:
+    """
+    Ultimate SD Upscale node that uses a GUIDER input for sampling.
+    This allows using custom guiders like PerpNegGuider during tiled upscaling.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        required, optional = USDU_guider_base_inputs()
+        return prepare_inputs(required, optional)
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "upscale"
+
+    CATEGORY = "image/upscaling"
+    OUTPUT_TOOLTIPS = ("The final upscaled image.",)
+    DESCRIPTION = "Upscales an image and runs image-to-image on tiles using a custom guider (e.g., PerpNegGuider, CFGGuider)."
+
+    def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
+                upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
+                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode):
+        # Store params
+        self.tile_width = tile_width
+        self.tile_height = tile_height
+        self.mask_blur = mask_blur
+        self.tile_padding = tile_padding
+        self.seam_fix_width = seam_fix_width
+        self.seam_fix_denoise = seam_fix_denoise
+        self.seam_fix_padding = seam_fix_padding
+        self.seam_fix_mode = seam_fix_mode
+        self.mode_type = mode_type
+        self.upscale_by = upscale_by
+        self.seam_fix_mask_blur = seam_fix_mask_blur
+
+        #
+        # Set up A1111 patches
+        #
+
+        # Upscaler
+        shared.sd_upscalers[0] = UpscalerData()
+        shared.actual_upscaler = upscale_model
+
+        # Set the batch of images
+        shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
+        shared.batch_as_tensor = image
+
+        # Processing with guider
+        sdprocessing = StableDiffusionProcessingGuider(
+            shared.batch[0], guider, sampler, sigmas, vae,
+            seed, upscale_by, force_uniform_tiles, tiled_decode,
+            tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
+        )
+
+        # Disable logging
+        logger = logging.getLogger()
+        old_level = logger.getEffectiveLevel()
+        logger.setLevel(logging.CRITICAL + 1)
+        try:
+            #
+            # Running the script
+            #
+            script = usdu.Script()
+            processed = script.run(p=sdprocessing, _=None, tile_width=self.tile_width, tile_height=self.tile_height,
+                               mask_blur=self.mask_blur, padding=self.tile_padding, seams_fix_width=self.seam_fix_width,
+                               seams_fix_denoise=self.seam_fix_denoise, seams_fix_padding=self.seam_fix_padding,
+                               upscaler_index=0, save_upscaled_image=False, redraw_mode=MODES[self.mode_type],
+                               save_seams_fix_image=False, seams_fix_mask_blur=self.seam_fix_mask_blur,
+                               seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], target_size_type=2,
+                               custom_width=None, custom_height=None, custom_scale=self.upscale_by)
+
+            # Return the resulting images
+            images = [pil_to_tensor(img) for img in shared.batch]
+            tensor = torch.cat(images, dim=0)
+            return (tensor,)
+        finally:
+            # Restore the original logging level
+            logger.setLevel(old_level)
+
+
+class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
+    """
+    Ultimate SD Upscale node (no initial upscale) that uses a GUIDER input for sampling.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        required, optional = USDU_guider_base_inputs()
+        remove_input(required, "upscale_model")
+        remove_input(required, "upscale_by")
+        rename_input(required, "image", "upscaled_image")
+        return prepare_inputs(required, optional)
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "upscale"
+    CATEGORY = "image/upscaling"
+    OUTPUT_TOOLTIPS = ("The final refined image.",)
+    DESCRIPTION = "Runs image-to-image on tiles from the input image using a custom guider (e.g., PerpNegGuider, CFGGuider)."
+
+    def upscale(self, upscaled_image, guider, sampler, sigmas, vae, seed,
+                mode_type, tile_width, tile_height, mask_blur, tile_padding,
+                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode):
+        upscale_by = 1.0
+        return super().upscale(upscaled_image, guider, sampler, sigmas, vae, upscale_by, seed,
+                               None, mode_type, tile_width, tile_height, mask_blur, tile_padding,
+                               seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
+                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode)
+
+
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
     "UltimateSDUpscale": UltimateSDUpscale,
     "UltimateSDUpscaleNoUpscale": UltimateSDUpscaleNoUpscale,
-    "UltimateSDUpscaleCustomSample": UltimateSDUpscaleCustomSample
+    "UltimateSDUpscaleCustomSample": UltimateSDUpscaleCustomSample,
+    "UltimateSDUpscaleGuider": UltimateSDUpscaleGuider,
+    "UltimateSDUpscaleNoUpscaleGuider": UltimateSDUpscaleNoUpscaleGuider,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UltimateSDUpscale": "Ultimate SD Upscale",
     "UltimateSDUpscaleNoUpscale": "Ultimate SD Upscale (No Upscale)",
-    "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)"
+    "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)",
+    "UltimateSDUpscaleGuider": "Ultimate SD Upscale (Guider)",
+    "UltimateSDUpscaleNoUpscaleGuider": "Ultimate SD Upscale (No Upscale, Guider)",
 }

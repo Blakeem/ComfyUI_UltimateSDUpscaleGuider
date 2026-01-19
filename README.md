@@ -6,7 +6,10 @@
 
 ## Fork Changes
 
-This fork adds **Guider input support** to enable the use of custom guiders (such as PerpNegGuider, CFGGuider, etc.) during tiled upscaling.
+This fork adds two key improvements over the original Ultimate SD Upscale:
+
+1. **Guider input support** - Use custom guiders (PerpNegGuider, CFGGuider, etc.) during tiled upscaling
+2. **Context Only Overlap mode** - A new tile processing mode that eliminates seams without the blur that comes from seam fix
 
 ### New Nodes Added
 
@@ -39,6 +42,48 @@ Instead of the standard nodes' separate inputs for:
 ### Note on Conditioning
 
 The Guider nodes skip per-tile conditioning cropping since conditioning is internal to the guider. This works perfectly for text-based guiders (PerpNegGuider, CFGGuider). For spatial conditioning (ControlNet, GLIGEN), use the original non-Guider nodes instead.
+
+---
+
+## Context Only Overlap Mode
+
+### The Problem with Traditional Tiled Upscaling
+
+When upscaling large images with tiles, each tile is processed independently. Even with padding for context, the actual pixels at tile boundaries are generated separately, leading to visible seams where tiles meet.
+
+The traditional solution is **seam fix** - a post-processing pass that re-processes the seam areas. While effective, seam fix can introduce blur and requires additional processing time.
+
+### Our Solution: Prevent Seams Instead of Fixing Them
+
+The **Context Only Overlap** mode takes a different approach: instead of fixing seams after they occur, it prevents them from happening in the first place.
+
+**How it works:**
+1. Each tile extends into its neighbors' territory by the `tile_padding` amount
+2. When processing subsequent tiles, the already-denoised overlap regions are used as **context for the attention mechanism** but are **not re-denoised**
+3. This allows each tile to "see" what its neighbors generated and create coherent continuations
+
+### Tile Overlap Mode Options
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Ignore Overlap** | Tiles use minimal size, no overlap handling | Fastest, may have visible seams |
+| **Reprocess Overlap** | Uniform tile sizes, overlap regions may be generated independently | Original behavior, seams possible |
+| **Context Only Overlap** | Overlap regions provide context without re-denoising | Best coherence, no seam fix blur |
+
+### Benefits of Context Only Overlap
+
+- **No seams at tile boundaries** - Tiles share context and create coherent transitions
+- **No blur from seam fix** - Eliminates the need for post-processing seam fix passes
+- **More coherent images** - Adjacent tiles "see" each other's output through the overlap context
+- **Works with all tile positions** - Including edge and corner tiles (bidirectional context sharing)
+
+### Recommended Settings
+
+For best results with Context Only Overlap mode:
+- Set `tile_overlap_mode` to "Context Only Overlap"
+- Use a `tile_padding` of 64-128 pixels (this becomes the overlap width)
+- `mask_blur` of 8-16 provides smooth blending at tile edges
+- Seam fix can typically be set to "None" since seams are prevented
 
 ## Installation
 

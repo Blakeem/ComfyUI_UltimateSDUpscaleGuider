@@ -157,7 +157,7 @@ class TestMainWorkflow:
                 seam_fix_width=64,
                 seam_fix_mask_blur=8,
                 seam_fix_padding=16,
-                force_uniform_tiles=True,
+                tile_overlap_mode="Reprocess Overlap",  # Changed from force_uniform_tiles=True
                 tiled_decode=False,
             )
         # Save images

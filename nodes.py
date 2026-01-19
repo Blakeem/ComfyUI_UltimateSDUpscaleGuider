@@ -5,7 +5,7 @@ import torch
 import comfy
 from usdu_patch import usdu
 from usdu_utils import tensor_to_pil, pil_to_tensor
-from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider
+from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider, TileOverlapMode
 import modules.shared as shared
 from modules.upscaler import UpscalerData
 
@@ -22,6 +22,12 @@ SEAM_FIX_MODES = {
     "Band Pass": usdu.USDUSFMode.BAND_PASS,
     "Half Tile": usdu.USDUSFMode.HALF_TILE,
     "Half Tile + Intersections": usdu.USDUSFMode.HALF_TILE_PLUS_INTERSECTIONS,
+}
+# Tile overlap modes mapping
+TILE_OVERLAP_MODES = {
+    "Ignore Overlap": TileOverlapMode.IGNORE,
+    "Reprocess Overlap": TileOverlapMode.REPROCESS,
+    "Context Only Overlap": TileOverlapMode.CONTEXT_ONLY,
 }
 
 
@@ -54,7 +60,7 @@ def USDU_base_inputs():
         ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
         # Misc
-        ("force_uniform_tiles", ("BOOLEAN", {"default": True, "tooltip": "Force all tiles to be the same as the set tile size, even when tiles could be smaller. This can help prevent the model from working with irregular tile sizes."})),
+        ("tile_overlap_mode", (list(TILE_OVERLAP_MODES.keys()), {"default": "Reprocess Overlap", "tooltip": "How to handle tile overlap regions. 'Ignore Overlap' uses minimal tile sizes. 'Reprocess Overlap' uses uniform tiles with overlap regions potentially regenerated. 'Context Only Overlap' uses uniform tiles where overlap regions from previous tiles become read-only context."})),
         ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
     ]
 
@@ -91,7 +97,7 @@ def USDU_guider_base_inputs():
         ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
         # Misc
-        ("force_uniform_tiles", ("BOOLEAN", {"default": True, "tooltip": "Force all tiles to be the same as the set tile size, even when tiles could be smaller."})),
+        ("tile_overlap_mode", (list(TILE_OVERLAP_MODES.keys()), {"default": "Reprocess Overlap", "tooltip": "How to handle tile overlap regions. 'Ignore Overlap' uses minimal tile sizes. 'Reprocess Overlap' uses uniform tiles with overlap regions potentially regenerated. 'Context Only Overlap' uses uniform tiles where overlap regions from previous tiles become read-only context."})),
         ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
     ]
 
@@ -144,7 +150,7 @@ class UltimateSDUpscale:
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, 
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode,
                 custom_sampler=None, custom_sigmas=None):
         # Store params
         self.tile_width = tile_width
@@ -176,7 +182,8 @@ class UltimateSDUpscale:
         # Processing
         sdprocessing = StableDiffusionProcessing(
             shared.batch[0], model, positive, negative, vae,
-            seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by, force_uniform_tiles, tiled_decode,
+            seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by,
+            TILE_OVERLAP_MODES[tile_overlap_mode], tiled_decode,
             tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
             custom_sampler, custom_sigmas,
         )
@@ -225,13 +232,13 @@ class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode):
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode):
         upscale_by = 1.0
         return super().upscale(upscaled_image, model, positive, negative, vae, upscale_by, seed,
                                steps, cfg, sampler_name, scheduler, denoise, None,
                                mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode)
+                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode)
     
 class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
     @classmethod
@@ -253,14 +260,14 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode,
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode,
                 upscale_model=None,
                 custom_sampler=None, custom_sigmas=None):
         return super().upscale(image, model, positive, negative, vae, upscale_by, seed,
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode,
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode,
                 custom_sampler, custom_sigmas)
 
 
@@ -284,7 +291,7 @@ class UltimateSDUpscaleGuider:
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode):
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode):
         # Store params
         self.tile_width = tile_width
         self.tile_height = tile_height
@@ -313,7 +320,7 @@ class UltimateSDUpscaleGuider:
         # Processing with guider
         sdprocessing = StableDiffusionProcessingGuider(
             shared.batch[0], guider, sampler, sigmas, vae,
-            seed, upscale_by, force_uniform_tiles, tiled_decode,
+            seed, upscale_by, TILE_OVERLAP_MODES[tile_overlap_mode], tiled_decode,
             tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
         )
 
@@ -364,12 +371,12 @@ class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
     def upscale(self, upscaled_image, guider, sampler, sigmas, vae, seed,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode):
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode):
         upscale_by = 1.0
         return super().upscale(upscaled_image, guider, sampler, sigmas, vae, upscale_by, seed,
                                None, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode)
+                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode)
 
 
 # A dictionary that contains all nodes you want to export with their names

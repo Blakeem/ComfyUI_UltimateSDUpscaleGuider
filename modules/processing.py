@@ -8,6 +8,9 @@ from modules import shared
 from tqdm import tqdm
 import comfy
 from enum import Enum
+from dataclasses import dataclass
+from typing import List, Optional
+import numpy as np
 import json
 import os
 
@@ -26,6 +29,66 @@ class USDUSFMode(Enum):
     HALF_TILE = 2
     HALF_TILE_PLUS_INTERSECTIONS = 3
 
+
+class TileOverlapMode(Enum):
+    """Modes for handling tile overlap during upscaling."""
+    IGNORE = 0       # Current uniform_tile_mode=False behavior - minimal tile sizes
+    REPROCESS = 1    # Current uniform_tile_mode=True behavior - uniform tiles, overlap may be regenerated
+    CONTEXT_ONLY = 2 # New mode - overlap regions are context only, not re-denoised
+
+
+@dataclass
+class ProcessedRegion:
+    """Rectangular region that has been denoised."""
+    x1: int
+    y1: int
+    x2: int  # exclusive
+    y2: int  # exclusive
+
+
+class ProcessedRegionTracker:
+    """Tracks which regions have been denoised to avoid reprocessing in CONTEXT_ONLY mode."""
+
+    def __init__(self):
+        self.regions: List[ProcessedRegion] = []
+
+    def add_region(self, x1: int, y1: int, x2: int, y2: int):
+        """Record a region as processed."""
+        self.regions.append(ProcessedRegion(x1, y1, x2, y2))
+
+    def get_exclusion_mask(self, tile_x1: int, tile_y1: int,
+                           tile_x2: int, tile_y2: int,
+                           full_width: int, full_height: int) -> Image.Image:
+        """
+        Create a full-size mask where:
+        - 255 (white) = needs denoising
+        - 0 (black) = already processed, context only
+
+        Returns mask covering just the tile region, positioned for the full image.
+        """
+        width = tile_x2 - tile_x1
+        height = tile_y2 - tile_y1
+
+        # Start with all white (everything needs denoising)
+        tile_mask = np.ones((height, width), dtype=np.uint8) * 255
+
+        for region in self.regions:
+            # Calculate intersection in tile-local coordinates
+            ix1 = max(region.x1 - tile_x1, 0)
+            iy1 = max(region.y1 - tile_y1, 0)
+            ix2 = min(region.x2 - tile_x1, width)
+            iy2 = min(region.y2 - tile_y1, height)
+
+            if ix1 < ix2 and iy1 < iy2:
+                tile_mask[iy1:iy2, ix1:ix2] = 0  # Mark as already processed
+
+        # Create full-size mask
+        full_mask = Image.new("L", (full_width, full_height), 0)
+        tile_mask_pil = Image.fromarray(tile_mask, mode='L')
+        full_mask.paste(tile_mask_pil, (tile_x1, tile_y1))
+
+        return full_mask
+
 class StableDiffusionProcessing:
 
     def __init__(
@@ -42,7 +105,7 @@ class StableDiffusionProcessing:
         scheduler,
         denoise,
         upscale_by,
-        uniform_tile_mode,
+        tile_overlap_mode,
         tiled_decode,
         tile_width,
         tile_height,
@@ -83,7 +146,13 @@ class StableDiffusionProcessing:
         # Variables used only by this script
         self.init_size = init_img.width, init_img.height
         self.upscale_by = upscale_by
-        self.uniform_tile_mode = uniform_tile_mode
+        # Handle tile_overlap_mode - default to REPROCESS for backward compatibility
+        if tile_overlap_mode is None:
+            self.tile_overlap_mode = TileOverlapMode.REPROCESS
+        else:
+            self.tile_overlap_mode = tile_overlap_mode
+        # Tracker for CONTEXT_ONLY mode (initialized by tile loop)
+        self.processed_tracker: Optional[ProcessedRegionTracker] = None
         self.tiled_decode = tiled_decode
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
@@ -141,7 +210,7 @@ class StableDiffusionProcessingGuider:
         vae,
         seed,
         upscale_by,
-        uniform_tile_mode,
+        tile_overlap_mode,
         tiled_decode,
         tile_width,
         tile_height,
@@ -183,7 +252,13 @@ class StableDiffusionProcessingGuider:
         # Variables used only by this script
         self.init_size = init_img.width, init_img.height
         self.upscale_by = upscale_by
-        self.uniform_tile_mode = uniform_tile_mode
+        # Handle tile_overlap_mode - default to REPROCESS for backward compatibility
+        if tile_overlap_mode is None:
+            self.tile_overlap_mode = TileOverlapMode.REPROCESS
+        else:
+            self.tile_overlap_mode = tile_overlap_mode
+        # Tracker for CONTEXT_ONLY mode (initialized by tile loop)
+        self.processed_tracker: Optional[ProcessedRegionTracker] = None
         self.tiled_decode = tiled_decode
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
@@ -324,7 +399,25 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     # Locate the white region of the mask outlining the tile and add padding
     crop_region = get_crop_region(image_mask, p.inpaint_full_res_padding)
 
-    if p.uniform_tile_mode:
+    # Get the mask bounding box (the white rectangle drawn by tile loop)
+    mask_bbox = image_mask.getbbox()
+    if mask_bbox is None:
+        # No white pixels, nothing to process
+        return Processed(p, [], p.seed, "")
+
+    if p.tile_overlap_mode == TileOverlapMode.IGNORE:
+        # Current uniform_tile_mode=False behavior
+        # Uses the minimal size that can fit the mask, minimizes tile size but may lead to image sizes that the model is not trained on
+        x1, y1, x2, y2 = crop_region
+        crop_width = x2 - x1
+        crop_height = y2 - y1
+        target_width = math.ceil(crop_width / 8) * 8
+        target_height = math.ceil(crop_height / 8) * 8
+        crop_region, tile_size = expand_crop(crop_region, image_mask.width,
+                                             image_mask.height, target_width, target_height)
+
+    elif p.tile_overlap_mode == TileOverlapMode.REPROCESS:
+        # Current uniform_tile_mode=True behavior
         # Expand the crop region to match the processing size ratio and then resize it to the processing size
         x1, y1, x2, y2 = crop_region
         crop_width = x2 - x1
@@ -339,15 +432,48 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             target_height = crop_height
         crop_region, _ = expand_crop(crop_region, image_mask.width, image_mask.height, target_width, target_height)
         tile_size = p.width, p.height
-    else:
-        # Uses the minimal size that can fit the mask, minimizes tile size but may lead to image sizes that the model is not trained on
+
+    elif p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY:
+        # NEW: Context-only overlap mode
+        # Use uniform tile size (like REPROCESS)
         x1, y1, x2, y2 = crop_region
         crop_width = x2 - x1
         crop_height = y2 - y1
-        target_width = math.ceil(crop_width / 8) * 8
-        target_height = math.ceil(crop_height / 8) * 8
-        crop_region, tile_size = expand_crop(crop_region, image_mask.width,
-                                             image_mask.height, target_width, target_height)
+        crop_ratio = crop_width / crop_height
+        p_ratio = p.width / p.height
+        if crop_ratio > p_ratio:
+            target_width = crop_width
+            target_height = round(crop_width / p_ratio)
+        else:
+            target_width = round(crop_height * p_ratio)
+            target_height = crop_height
+        crop_region, _ = expand_crop(crop_region, image_mask.width, image_mask.height, target_width, target_height)
+        tile_size = p.width, p.height
+
+        # Apply exclusion mask if tracker exists
+        if p.processed_tracker is not None:
+            # Get the extended mask region (original mask bbox)
+            # The mask was already drawn with overlap extension by the tile loop
+            extended_x1, extended_y1, extended_x2, extended_y2 = mask_bbox
+
+            # Create exclusion mask (black where already processed)
+            exclusion_mask = p.processed_tracker.get_exclusion_mask(
+                extended_x1, extended_y1, extended_x2, extended_y2,
+                image_mask.width, image_mask.height
+            )
+
+            # Apply exclusion: where exclusion is black (0), set image_mask to black
+            # This is done by taking the minimum of both masks
+            mask_array = np.array(image_mask)
+            exclusion_array = np.array(exclusion_mask)
+            combined = np.minimum(mask_array, exclusion_array)
+            image_mask = Image.fromarray(combined, mode='L')
+
+            # Record what we're about to denoise (after exclusions)
+            # Find the actual bbox of what remains white
+            final_bbox = image_mask.getbbox()
+            if final_bbox:
+                p.processed_tracker.add_region(*final_bbox)
 
     # Blur the mask
     if p.mask_blur > 0:

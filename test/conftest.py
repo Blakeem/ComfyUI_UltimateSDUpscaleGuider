@@ -56,6 +56,18 @@ def _find_comfyui_root() -> Path:
 
 COMFYUI_ROOT = _find_comfyui_root()
 
+# Make sure the repo root is in sys.path for imports
+# Ensure submodule root is in path for test imports
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+# Ensure ComfyUI path is set up
+if str(COMFYUI_ROOT) not in sys.path:
+    sys.path.insert(0, str(COMFYUI_ROOT))
+
+
+# Session scoped fixtures
+from fixtures_images import base_image
+
 
 #
 # # Path Setup
@@ -88,16 +100,9 @@ def pytest_configure(config):
     # Download test images
     download_test_images(
         repo_id="ssitu/ultimatesdupscale_test",
-        save_dir="./test_images/",
+        save_dir=(REPO_ROOT / "test" / "test_images").resolve(),
         repo_folder="test_images",
     )
-    # Ensure submodule root is in path for test imports
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-
-    # Ensure ComfyUI path is set up
-    if str(COMFYUI_ROOT) not in sys.path:
-        sys.path.insert(0, str(COMFYUI_ROOT))
 
     from comfy.cli_args import args
 
@@ -114,14 +119,6 @@ def pytest_configure(config):
 #
 # # Fixtures
 #
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an event loop for the test session."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
 @pytest.fixture(scope="session")
 def comfyui_initialized():
     """Initialize ComfyUI nodes once per test session."""
@@ -182,7 +179,7 @@ def upscale_model(comfyui_initialized, node_classes):
     if TEST_UPSCALE_MODEL not in upscale_models:
         pytest.skip("No upscale models found")
 
-    model_name = upscale_models[0]
+    model_name = TEST_UPSCALE_MODEL
     with torch.inference_mode():
         (model,) = execute(UpscaleModelLoader, model_name)
 
@@ -202,7 +199,7 @@ def test_dirs():
     )
 
 
-@pytest.fixture(scope="class")
+@pytest.fixture(scope="session")
 def seed():
     """Default seed for reproducible tests."""
     return 1

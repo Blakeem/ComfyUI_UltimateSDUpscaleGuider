@@ -1,4 +1,5 @@
 from PIL import Image, ImageFilter
+import logging
 import torch
 import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
@@ -6,7 +7,8 @@ from comfy_extras.nodes_custom_sampler import SamplerCustom
 from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
 from modules import shared
 from tqdm import tqdm
-import comfy
+import comfy.utils as comfy_utils
+import comfy.sample
 from enum import Enum
 from dataclasses import dataclass
 from typing import List, Optional
@@ -14,8 +16,13 @@ import numpy as np
 import json
 import os
 
-if (not hasattr(Image, 'Resampling')):  # For older versions of Pillow
-    Image.Resampling = Image
+logger = logging.getLogger(__name__)
+
+# Compatibility for older Pillow versions
+try:
+    Image.Resampling  # type: ignore
+except Exception:
+    Image.Resampling = Image  # type: ignore
 
 # Taken from the USDU script
 class USDUMode(Enum):
@@ -113,10 +120,11 @@ class StableDiffusionProcessing:
         seam_fix_mode,
         custom_sampler=None,
         custom_sigmas=None,
+        batch_size=1,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
-        self.image_mask = None
+        self.image_mask = Image.new('L', init_img.size, 0)  # Placeholder mask
         self.mask_blur = 0
         self.inpaint_full_res_padding = 0
         self.width = init_img.width * upscale_by
@@ -141,7 +149,7 @@ class StableDiffusionProcessing:
         self.custom_sigmas = custom_sigmas
 
         if (custom_sampler is not None) ^ (custom_sigmas is not None):
-            print("[USDU] Both custom sampler and custom sigmas must be provided, defaulting to widget sampler and sigmas")
+            logger.warning("Both custom sampler and custom sigmas must be provided, defaulting to widget sampler and sigmas")
 
         # Variables used only by this script
         self.init_size = init_img.width, init_img.height
@@ -154,12 +162,13 @@ class StableDiffusionProcessing:
         # Tracker for CONTEXT_ONLY mode (initialized by tile loop)
         self.processed_tracker: Optional[ProcessedRegionTracker] = None
         self.tiled_decode = tiled_decode
+        self.batch_size = batch_size
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
         self.vae_decoder_tiled = VAEDecodeTiled()
 
         if self.tiled_decode:
-            print("[USDU] Using tiled decode")
+            logger.info("Using tiled decode")
 
         # Other required A1111 variables for the USDU script that is currently unused in this script
         self.extra_generation_params = {}
@@ -172,11 +181,12 @@ class StableDiffusionProcessing:
                 config = json.load(f)
 
         # Progress bar for the entire process instead of per tile
+        self.pbar: Optional[tqdm] = None
+        self.tiles = 0
         self.progress_bar_enabled = False
-        if comfy.utils.PROGRESS_BAR_ENABLED:
+        if comfy_utils.PROGRESS_BAR_ENABLED:
             self.progress_bar_enabled = True
-            comfy.utils.PROGRESS_BAR_ENABLED = config.get('per_tile_progress', True)
-            self.tiles = 0
+            comfy_utils.PROGRESS_BAR_ENABLED = config.get('per_tile_progress', True)
             if redraw_mode.value != USDUMode.NONE.value:
                 self.tiles += self.rows * self.cols
             if seam_fix_mode.value == USDUSFMode.BAND_PASS.value:
@@ -185,13 +195,16 @@ class StableDiffusionProcessing:
                 self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows
             elif seam_fix_mode.value == USDUSFMode.HALF_TILE_PLUS_INTERSECTIONS.value:
                 self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows + (self.rows - 1) * (self.cols - 1)
-            self.pbar = None
-            # self.pbar = tqdm(total=self.tiles, desc='USDU') # Creating the pbar here will cause an empty progress bar to be displayed
+
+    @property
+    def uniform_tile_mode(self):
+        """Derived property for backward compatibility with _prepare_tile_for_batch()."""
+        return self.tile_overlap_mode != TileOverlapMode.IGNORE
 
     def __del__(self):
         # Undo changes to progress bar flag when node is done or cancelled
         if self.progress_bar_enabled:
-            comfy.utils.PROGRESS_BAR_ENABLED = True
+            comfy_utils.PROGRESS_BAR_ENABLED = True
 
 
 class StableDiffusionProcessingGuider:
@@ -216,10 +229,11 @@ class StableDiffusionProcessingGuider:
         tile_height,
         redraw_mode,
         seam_fix_mode,
+        batch_size=1,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
-        self.image_mask = None
+        self.image_mask = Image.new('L', init_img.size, 0)  # Placeholder mask
         self.mask_blur = 0
         self.inpaint_full_res_padding = 0
         self.width = init_img.width * upscale_by
@@ -260,12 +274,13 @@ class StableDiffusionProcessingGuider:
         # Tracker for CONTEXT_ONLY mode (initialized by tile loop)
         self.processed_tracker: Optional[ProcessedRegionTracker] = None
         self.tiled_decode = tiled_decode
+        self.batch_size = batch_size
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
         self.vae_decoder_tiled = VAEDecodeTiled()
 
         if self.tiled_decode:
-            print("[USDU Guider] Using tiled decode")
+            logger.info("Using tiled decode")
 
         # Other required A1111 variables for the USDU script that is currently unused in this script
         self.extra_generation_params = {}
@@ -278,11 +293,12 @@ class StableDiffusionProcessingGuider:
                 config = json.load(f)
 
         # Progress bar for the entire process instead of per tile
+        self.pbar: Optional[tqdm] = None
+        self.tiles = 0
         self.progress_bar_enabled = False
-        if comfy.utils.PROGRESS_BAR_ENABLED:
+        if comfy_utils.PROGRESS_BAR_ENABLED:
             self.progress_bar_enabled = True
-            comfy.utils.PROGRESS_BAR_ENABLED = config.get('per_tile_progress', True)
-            self.tiles = 0
+            comfy_utils.PROGRESS_BAR_ENABLED = config.get('per_tile_progress', True)
             if redraw_mode.value != USDUMode.NONE.value:
                 self.tiles += self.rows * self.cols
             if seam_fix_mode.value == USDUSFMode.BAND_PASS.value:
@@ -291,12 +307,16 @@ class StableDiffusionProcessingGuider:
                 self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows
             elif seam_fix_mode.value == USDUSFMode.HALF_TILE_PLUS_INTERSECTIONS.value:
                 self.tiles += (self.rows - 1) * self.cols + (self.cols - 1) * self.rows + (self.rows - 1) * (self.cols - 1)
-            self.pbar = None
+
+    @property
+    def uniform_tile_mode(self):
+        """Derived property for backward compatibility with _prepare_tile_for_batch()."""
+        return self.tile_overlap_mode != TileOverlapMode.IGNORE
 
     def __del__(self):
         # Undo changes to progress bar flag when node is done or cancelled
         if self.progress_bar_enabled:
-            comfy.utils.PROGRESS_BAR_ENABLED = True
+            comfy_utils.PROGRESS_BAR_ENABLED = True
 
 
 class Processed:
@@ -315,7 +335,7 @@ def fix_seed(p: StableDiffusionProcessing):
 
 
 def sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise, custom_sampler, custom_sigmas):
-    # Choose way to sample based on given inputs
+    """Choose the way to sample based on given inputs."""
 
     # Custom sampler and sigmas
     if custom_sampler is not None and custom_sigmas is not None:
@@ -330,7 +350,7 @@ def sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
             sigmas=custom_sigmas,
             latent_image=latent
         )
-        if "execute" in dir(SamplerCustom):
+        if hasattr(SamplerCustom, "execute"):
             (samples, _) = SamplerCustom.execute(**kwargs)
         else:
             custom_sample = SamplerCustom()
@@ -375,7 +395,7 @@ def sample_with_guider(guider, seed, sampler, sigmas, latent):
         sigmas,
         denoise_mask=noise_mask,
         callback=None,
-        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+        disable_pbar=not comfy_utils.PROGRESS_BAR_ENABLED,
         seed=seed
     )
 
@@ -506,7 +526,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
                          negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
 
     # Update the progress bar
-    if p.progress_bar_enabled:
+    if p.progress_bar_enabled and p.pbar is not None:
         p.pbar.update(1)
 
     # Decode the sample
@@ -544,5 +564,5 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
         shared.batch[i] = result
 
-    processed = Processed(p, [shared.batch[0]], p.seed, None)
+    processed = Processed(p, [shared.batch[0]], p.seed, "")
     return processed

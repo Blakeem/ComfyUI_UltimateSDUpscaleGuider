@@ -1,13 +1,29 @@
 # ComfyUI Node for Ultimate SD Upscale by Coyote-A: https://github.com/Coyote-A/ultimate-upscale-for-automatic1111
 
 import logging
+from contextlib import contextmanager
 import torch
 import comfy
+import comfy.utils as comfy_utils
 from usdu_patch import usdu
 from usdu_utils import tensor_to_pil, pil_to_tensor
 from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider, TileOverlapMode
 import modules.shared as shared
 from modules.upscaler import UpscalerData
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def suppress_logging(level=logging.CRITICAL + 1):
+    """Context manager to temporarily suppress logging output."""
+    root_logger = logging.getLogger()
+    old_level = root_logger.getEffectiveLevel()
+    root_logger.setLevel(level)
+    try:
+        yield
+    finally:
+        root_logger.setLevel(old_level)
 
 MAX_RESOLUTION = 8192
 # The modes available for Ultimate SD Upscale
@@ -60,8 +76,9 @@ def USDU_base_inputs():
         ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
         # Misc
-        ("tile_overlap_mode", (list(TILE_OVERLAP_MODES.keys()), {"default": "Reprocess Overlap", "tooltip": "How to handle tile overlap regions. 'Ignore Overlap' uses minimal tile sizes. 'Reprocess Overlap' uses uniform tiles with overlap regions potentially regenerated. 'Context Only Overlap' uses uniform tiles where overlap regions from previous tiles become read-only context."})),
+        ("force_uniform_tiles", ("BOOLEAN", {"default": True, "tooltip": "Force all tiles to be the same as the set tile size, even when tiles could be smaller. This can help prevent the model from working with irregular tile sizes."})),
         ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
+        ("batch_size", ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1, "tooltip": "The number of tiles to process in a batch. Higher values can reduce processing time but use more VRAM. Yields different results than individual tiles. Only affects the main redraw step, not the seam fix step."})),
     ]
 
     optional = []
@@ -99,6 +116,7 @@ def USDU_guider_base_inputs():
         # Misc
         ("tile_overlap_mode", (list(TILE_OVERLAP_MODES.keys()), {"default": "Reprocess Overlap", "tooltip": "How to handle tile overlap regions. 'Ignore Overlap' uses minimal tile sizes. 'Reprocess Overlap' uses uniform tiles with overlap regions potentially regenerated. 'Context Only Overlap' uses uniform tiles where overlap regions from previous tiles become read-only context."})),
         ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
+        ("batch_size", ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1, "tooltip": "The number of tiles to process in a batch. Higher values can reduce processing time but use more VRAM. Yields different results than individual tiles. Only affects the main redraw step, not the seam fix step."})),
     ]
 
     optional = []
@@ -150,68 +168,59 @@ class UltimateSDUpscale:
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
                 custom_sampler=None, custom_sigmas=None):
-        # Store params
-        self.tile_width = tile_width
-        self.tile_height = tile_height
-        self.mask_blur = mask_blur
-        self.tile_padding = tile_padding
-        self.seam_fix_width = seam_fix_width
-        self.seam_fix_denoise = seam_fix_denoise
-        self.seam_fix_padding = seam_fix_padding
-        self.seam_fix_mode = seam_fix_mode
-        self.mode_type = mode_type
-        self.upscale_by = upscale_by
-        self.seam_fix_mask_blur = seam_fix_mask_blur
+        redraw_mode = MODES[mode_type]
+        seam_fix_mode = SEAM_FIX_MODES[seam_fix_mode]
 
         #
         # Set up A1111 patches
         #
 
         # Upscaler
-        # An object that the script works with
         shared.sd_upscalers[0] = UpscalerData()
-        # Where the actual upscaler is stored, will be used when the script upscales using the Upscaler in UpscalerData
         shared.actual_upscaler = upscale_model
 
         # Set the batch of images
         shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
         shared.batch_as_tensor = image
 
+        logger.debug("UltimateSDUpscale.upscale() using batch_size=%s", batch_size)
+        if batch_size > 1 and not force_uniform_tiles:
+            raise ValueError("batch_size > 1 requires force_uniform_tiles to be True; all tiles in the batch must be the same size.")
+
+        # Convert boolean to TileOverlapMode enum
+        tile_overlap_mode = TileOverlapMode.REPROCESS if force_uniform_tiles else TileOverlapMode.IGNORE
+
         # Processing
         sdprocessing = StableDiffusionProcessing(
             shared.batch[0], model, positive, negative, vae,
             seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by,
-            TILE_OVERLAP_MODES[tile_overlap_mode], tiled_decode,
-            tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
-            custom_sampler, custom_sigmas,
+            tile_overlap_mode, tiled_decode,
+            tile_width, tile_height, redraw_mode, seam_fix_mode,
+            custom_sampler, custom_sigmas, batch_size,
         )
 
-        # Disable logging
-        logger = logging.getLogger()
-        old_level = logger.getEffectiveLevel()
-        logger.setLevel(logging.CRITICAL + 1)
-        try:
-            #
-            # Running the script
-            #
-            script = usdu.Script()
-            processed = script.run(p=sdprocessing, _=None, tile_width=self.tile_width, tile_height=self.tile_height,
-                               mask_blur=self.mask_blur, padding=self.tile_padding, seams_fix_width=self.seam_fix_width,
-                               seams_fix_denoise=self.seam_fix_denoise, seams_fix_padding=self.seam_fix_padding,
-                               upscaler_index=0, save_upscaled_image=False, redraw_mode=MODES[self.mode_type],
-                               save_seams_fix_image=False, seams_fix_mask_blur=self.seam_fix_mask_blur,
-                               seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], target_size_type=2,
-                               custom_width=None, custom_height=None, custom_scale=self.upscale_by)
+        # Suppress logging to prevent duplicate tqdm progress bars
+        with suppress_logging():
+            try:
+                script = usdu.Script()
+                processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                                   mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
+                                   seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
+                                   upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
+                                   save_seams_fix_image=False, seams_fix_mask_blur=seam_fix_mask_blur,
+                                   seams_fix_type=seam_fix_mode, target_size_type=2,
+                                   custom_width=None, custom_height=None, custom_scale=upscale_by)
 
-            # Return the resulting images
-            images = [pil_to_tensor(img) for img in shared.batch]
-            tensor = torch.cat(images, dim=0)
-            return (tensor,)
-        finally:
-            # Restore the original logging level
-            logger.setLevel(old_level)
+                # Return the resulting images
+                images = [pil_to_tensor(img) for img in shared.batch]
+                tensor = torch.cat(images, dim=0)
+                return (tensor,)
+            finally:
+                # Restore progress bar (belt-and-suspenders with __del__)
+                if sdprocessing.progress_bar_enabled:
+                    comfy_utils.PROGRESS_BAR_ENABLED = True
 
 class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
     @classmethod
@@ -232,14 +241,17 @@ class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode):
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1):
         upscale_by = 1.0
+
+        logger.debug("UltimateSDUpscaleNoUpscale.upscale() received batch_size=%s", batch_size)
+
         return super().upscale(upscaled_image, model, positive, negative, vae, upscale_by, seed,
                                steps, cfg, sampler_name, scheduler, denoise, None,
                                mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode)
-    
+                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size)
+
 class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
     @classmethod
     def INPUT_TYPES(s):
@@ -249,7 +261,7 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
         optional.append(("custom_sampler", ("SAMPLER", {"tooltip": "A custom sampler to use instead of the built-in ComfyUI sampler specified by sampler_name. Only used if both custom_sampler and custom_sigmas are provided."})))
         optional.append(("custom_sigmas", ("SIGMAS", {"tooltip": "A custom noise schedule to use during sampling. Only used if both custom_sampler and custom_sigmas are provided."})))
         return prepare_inputs(required, optional)
-    
+
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
@@ -260,14 +272,14 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
                 upscale_model=None,
                 custom_sampler=None, custom_sigmas=None):
         return super().upscale(image, model, positive, negative, vae, upscale_by, seed,
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size,
                 custom_sampler, custom_sigmas)
 
 
@@ -291,19 +303,17 @@ class UltimateSDUpscaleGuider:
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode):
-        # Store params
-        self.tile_width = tile_width
-        self.tile_height = tile_height
-        self.mask_blur = mask_blur
-        self.tile_padding = tile_padding
-        self.seam_fix_width = seam_fix_width
-        self.seam_fix_denoise = seam_fix_denoise
-        self.seam_fix_padding = seam_fix_padding
-        self.seam_fix_mode = seam_fix_mode
-        self.mode_type = mode_type
-        self.upscale_by = upscale_by
-        self.seam_fix_mask_blur = seam_fix_mask_blur
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1):
+
+        tile_overlap_mode_enum = TILE_OVERLAP_MODES[tile_overlap_mode]
+
+        # Validate batch_size incompatibilities
+        if batch_size > 1 and tile_overlap_mode_enum == TileOverlapMode.CONTEXT_ONLY:
+            raise ValueError("batch_size > 1 is not compatible with Context Only Overlap mode. "
+                             "Context Only Overlap requires sequential tile processing.")
+        if batch_size > 1 and tile_overlap_mode_enum == TileOverlapMode.IGNORE:
+            raise ValueError("batch_size > 1 requires uniform tile sizes. "
+                             "Use 'Reprocess Overlap' or 'Context Only Overlap' mode.")
 
         #
         # Set up A1111 patches
@@ -317,37 +327,37 @@ class UltimateSDUpscaleGuider:
         shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
         shared.batch_as_tensor = image
 
+        redraw_mode = MODES[mode_type]
+        seam_fix_mode_enum = SEAM_FIX_MODES[seam_fix_mode]
+
         # Processing with guider
         sdprocessing = StableDiffusionProcessingGuider(
             shared.batch[0], guider, sampler, sigmas, vae,
-            seed, upscale_by, TILE_OVERLAP_MODES[tile_overlap_mode], tiled_decode,
-            tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
+            seed, upscale_by, tile_overlap_mode_enum, tiled_decode,
+            tile_width, tile_height, redraw_mode, seam_fix_mode_enum,
+            batch_size,
         )
 
-        # Disable logging
-        logger = logging.getLogger()
-        old_level = logger.getEffectiveLevel()
-        logger.setLevel(logging.CRITICAL + 1)
-        try:
-            #
-            # Running the script
-            #
-            script = usdu.Script()
-            processed = script.run(p=sdprocessing, _=None, tile_width=self.tile_width, tile_height=self.tile_height,
-                               mask_blur=self.mask_blur, padding=self.tile_padding, seams_fix_width=self.seam_fix_width,
-                               seams_fix_denoise=self.seam_fix_denoise, seams_fix_padding=self.seam_fix_padding,
-                               upscaler_index=0, save_upscaled_image=False, redraw_mode=MODES[self.mode_type],
-                               save_seams_fix_image=False, seams_fix_mask_blur=self.seam_fix_mask_blur,
-                               seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], target_size_type=2,
-                               custom_width=None, custom_height=None, custom_scale=self.upscale_by)
+        # Suppress logging to prevent duplicate tqdm progress bars
+        with suppress_logging():
+            try:
+                script = usdu.Script()
+                processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                                   mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
+                                   seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
+                                   upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
+                                   save_seams_fix_image=False, seams_fix_mask_blur=seam_fix_mask_blur,
+                                   seams_fix_type=seam_fix_mode_enum, target_size_type=2,
+                                   custom_width=None, custom_height=None, custom_scale=upscale_by)
 
-            # Return the resulting images
-            images = [pil_to_tensor(img) for img in shared.batch]
-            tensor = torch.cat(images, dim=0)
-            return (tensor,)
-        finally:
-            # Restore the original logging level
-            logger.setLevel(old_level)
+                # Return the resulting images
+                images = [pil_to_tensor(img) for img in shared.batch]
+                tensor = torch.cat(images, dim=0)
+                return (tensor,)
+            finally:
+                # Restore progress bar (belt-and-suspenders with __del__)
+                if sdprocessing.progress_bar_enabled:
+                    comfy_utils.PROGRESS_BAR_ENABLED = True
 
 
 class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
@@ -371,12 +381,12 @@ class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
     def upscale(self, upscaled_image, guider, sampler, sigmas, vae, seed,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode):
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1):
         upscale_by = 1.0
         return super().upscale(upscaled_image, guider, sampler, sigmas, vae, upscale_by, seed,
                                None, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode)
+                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size)
 
 
 # A dictionary that contains all nodes you want to export with their names

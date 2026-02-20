@@ -1,86 +1,24 @@
 """
-Tests a common workflow for UltimateSDUpscale.
+Tests a common workflow for UltimateSDUpscale with Guider support.
 """
 
 import logging
 import pathlib
 import pytest
 import torch
-from PIL import Image
 
-import usdu_utils
 from setup_utils import execute
 from tensor_utils import img_tensor_mae, blur
-from io_utils import save_image, load_image
+from io_utils import save_image, load_image, image_name_format
 from configs import DirectoryConfig
+from fixtures_images import EXT
 
 # Image file names
-EXT = ".jpg"
 CATEGORY = pathlib.Path("main_workflow")
-BASE_IMAGE_1_NAME = "main1_sd15" + EXT
-BASE_IMAGE_2_NAME = "main2_sd15" + EXT
-UPSCALED_IMAGE_1_NAME = "main1_sd15_upscaled" + EXT
-UPSCALED_IMAGE_2_NAME = "main2_sd15_upscaled" + EXT
-
-# Prepend category path
-BASE_IMAGE_1 = CATEGORY / BASE_IMAGE_1_NAME
-BASE_IMAGE_2 = CATEGORY / BASE_IMAGE_2_NAME
-UPSCALED_IMAGE_1 = CATEGORY / UPSCALED_IMAGE_1_NAME
-UPSCALED_IMAGE_2 = CATEGORY / UPSCALED_IMAGE_2_NAME
 
 
-class TestMainWorkflow:
-    """Integration tests for the main upscaling workflow."""
-
-    @pytest.fixture(scope="class")
-    def base_image(self, loaded_checkpoint, seed, test_dirs, node_classes):
-        """Generate a base image for upscaling tests."""
-        EmptyLatentImage = node_classes["EmptyLatentImage"]
-        CLIPTextEncode = node_classes["CLIPTextEncode"]
-        KSampler = node_classes["KSampler"]
-        VAEDecode = node_classes["VAEDecode"]
-
-        model, clip, vae = loaded_checkpoint
-
-        with torch.inference_mode():
-            (empty_latent,) = execute(
-                EmptyLatentImage, width=512, height=512, batch_size=2
-            )
-
-            (positive,) = execute(
-                CLIPTextEncode,
-                text="beautiful scenery nature glass bottle landscape, , purple galaxy bottle,",
-                clip=clip,
-            )
-
-            (negative,) = execute(CLIPTextEncode, text="text, watermark", clip=clip)
-
-            (samples,) = execute(
-                KSampler,
-                model=model,
-                positive=positive,
-                negative=negative,
-                latent_image=empty_latent,
-                seed=seed,
-                steps=10,
-                cfg=8,
-                sampler_name="dpmpp_2m",
-                scheduler="karras",
-                denoise=1.0,
-            )
-
-            (image,) = execute(VAEDecode, samples=samples, vae=vae)
-
-        # Save base images
-        sample_dir = test_dirs.sample_images
-        base_img1_path = sample_dir / BASE_IMAGE_1
-        base_img2_path = sample_dir / BASE_IMAGE_2
-        save_image(image[0:1], base_img1_path)
-        save_image(image[1:2], base_img2_path)
-
-        # Load images back as tensors to account for compression
-        image = torch.cat([load_image(base_img1_path), load_image(base_img2_path)])
-        return image, positive, negative
+class TestMainWorkflowGuider:
+    """Integration tests for the guider-based upscaling workflow."""
 
     def test_base_image_matches_reference(self, base_image, test_dirs: DirectoryConfig):
         """
@@ -93,6 +31,7 @@ class TestMainWorkflow:
         im1 = image[0:1]
         im2 = image[1:2]
 
+        from fixtures_images import BASE_IMAGE_1, BASE_IMAGE_2
         test_im1 = load_image(test_image_dir / BASE_IMAGE_1)
         test_im2 = load_image(test_image_dir / BASE_IMAGE_2)
 
@@ -157,13 +96,16 @@ class TestMainWorkflow:
                 seam_fix_width=64,
                 seam_fix_mask_blur=8,
                 seam_fix_padding=16,
-                tile_overlap_mode="Reprocess Overlap",  # Changed from force_uniform_tiles=True
+                tile_overlap_mode="Reprocess Overlap",
                 tiled_decode=False,
             )
+
         # Save images
+        im1_filename = "main1_sd15_upscaled" + EXT
+        im2_filename = "main2_sd15_upscaled" + EXT
         sample_dir = test_dirs.sample_images
-        upscaled_img1_path = sample_dir / UPSCALED_IMAGE_1
-        upscaled_img2_path = sample_dir / UPSCALED_IMAGE_2
+        upscaled_img1_path = sample_dir / CATEGORY / im1_filename
+        upscaled_img2_path = sample_dir / CATEGORY / im2_filename
         save_image(upscaled[0], upscaled_img1_path)
         save_image(upscaled[1], upscaled_img2_path)
         # Load
@@ -176,14 +118,17 @@ class TestMainWorkflow:
         self, upscaled_image, test_dirs: DirectoryConfig
     ):
         """Test upscaling with UltimateSDUpscaleGuider node."""
-        logger = logging.getLogger("test_upscale_with_custom_sampler")
+        logger = logging.getLogger("test_upscale_with_guider")
         # Verify results
         test_image_dir = test_dirs.test_images
         im1_upscaled = upscaled_image[0]
         im2_upscaled = upscaled_image[1]
 
-        test_im1_upscaled = load_image(test_image_dir / UPSCALED_IMAGE_1)
-        test_im2_upscaled = load_image(test_image_dir / UPSCALED_IMAGE_2)
+        im1_filename = "main1_sd15_upscaled" + EXT
+        im2_filename = "main2_sd15_upscaled" + EXT
+
+        test_im1_upscaled = load_image(test_image_dir / CATEGORY / im1_filename)
+        test_im2_upscaled = load_image(test_image_dir / CATEGORY / im2_filename)
 
         diff1 = img_tensor_mae(blur(im1_upscaled), blur(test_im1_upscaled))
         diff2 = img_tensor_mae(blur(im2_upscaled), blur(test_im2_upscaled))
@@ -197,9 +142,96 @@ class TestMainWorkflow:
         """Save sample images for visual inspection (optional utility test)."""
         sample_dir = test_dirs.sample_images
 
+        im1_filename = "main1_sd15_upscaled" + EXT
+        im2_filename = "main2_sd15_upscaled" + EXT
+
         # Save upscaled images
-        save_image(upscaled_image[0], sample_dir / UPSCALED_IMAGE_1)
-        save_image(upscaled_image[1], sample_dir / UPSCALED_IMAGE_2)
+        save_image(upscaled_image[0], sample_dir / CATEGORY / im1_filename)
+        save_image(upscaled_image[1], sample_dir / CATEGORY / im2_filename)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+class TestUpstreamMainWorkflow:
+    """Integration tests for the upstream (non-guider) upscaling workflow.
+
+    These tests reference UltimateSDUpscale which is NOT exported by this fork.
+    They will be skipped if the upstream nodes are not available.
+    """
+
+    def test_upscale(
+        self,
+        base_image,
+        loaded_checkpoint,
+        upscale_model,
+        node_classes,
+        seed,
+        batch_size,
+        test_dirs: DirectoryConfig,
+    ):
+        """Generate upscaled images using standard workflow."""
+        if "UltimateSDUpscale" not in node_classes:
+            pytest.skip("Non-guider UltimateSDUpscale node not exported by this fork")
+
+        image, positive, negative = base_image
+        model, clip, vae = loaded_checkpoint
+
+        with torch.inference_mode():
+            usdu = node_classes["UltimateSDUpscale"]
+            (upscaled,) = usdu().upscale(
+                image=image,
+                model=model,
+                positive=positive,
+                negative=negative,
+                vae=vae,
+                upscale_by=2.00000004,
+                seed=seed,
+                steps=5,
+                cfg=8,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=0.7,
+                upscale_model=upscale_model,
+                mode_type="Chess",
+                tile_width=512,
+                tile_height=512,
+                mask_blur=8,
+                tile_padding=32,
+                seam_fix_mode="None",
+                seam_fix_denoise=1.0,
+                seam_fix_width=64,
+                seam_fix_mask_blur=8,
+                seam_fix_padding=16,
+                force_uniform_tiles=True,
+                tiled_decode=False,
+                batch_size=batch_size,
+            )
+
+        # Save images
+        im1_filename = image_name_format("upscaled_image1", EXT, batch_size)
+        im2_filename = image_name_format("upscaled_image2", EXT, batch_size)
+        sample_dir = test_dirs.sample_images
+        upscaled_img1_path = sample_dir / CATEGORY / im1_filename
+        upscaled_img2_path = sample_dir / CATEGORY / im2_filename
+        save_image(upscaled[0], upscaled_img1_path)
+        save_image(upscaled[1], upscaled_img2_path)
+        # Load to account for compression
+        upscaled = torch.cat(
+            [load_image(upscaled_img1_path), load_image(upscaled_img2_path)]
+        )
+        # Verify results
+        logger = logging.getLogger("test_upscale")
+        test_image_dir = test_dirs.test_images
+        im1_upscaled = upscaled[0]
+        im2_upscaled = upscaled[1]
+
+        test_im1 = load_image(test_image_dir / CATEGORY / im1_filename)
+        test_im2 = load_image(test_image_dir / CATEGORY / im2_filename)
+
+        diff1 = img_tensor_mae(blur(im1_upscaled), blur(test_im1))
+        diff2 = img_tensor_mae(blur(im2_upscaled), blur(test_im2))
+        logger.info(f"Diff1: {diff1}, Diff2: {diff2}")
+        assert diff1 < 0.01, "Upscaled Image 1 doesn't match its test image."
+        assert diff2 < 0.01, "Upscaled Image 2 doesn't match its test image."
 
 
 # Allow running directly for debugging
